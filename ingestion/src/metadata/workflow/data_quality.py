@@ -97,20 +97,3 @@ class TestSuiteWorkflow(IngestionWorkflow):
                     f" using the secrets manager provider [{self.metadata.config.secretsManagerProvider}]: {exc}"
                 )
                 raise exc
-
-    def _get_ingestion_pipeline_service(self) -> Optional[T]:
-        """
-        Ingestion Pipelines are linked to either an EntityService (DatabaseService, MessagingService,...)
-        or a Test Suite.
-
-        Depending on the Source Config Type, we'll need to GET one or the other to create
-        the Ingestion Pipeline
-        """
-        return self.metadata.get_by_name(
-            entity=TestSuite,
-            fqn=fqn.build(
-                metadata=None,
-                entity_type=TestSuite,
-                table_fqn=self.config.source.sourceConfig.config.entityFullyQualifiedName,
-            ),
-        )

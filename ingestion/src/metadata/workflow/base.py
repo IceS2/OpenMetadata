@@ -50,7 +50,11 @@ from metadata.workflow.output_handler import report_ingestion_status
 from metadata.workflow.workflow_status_mixin import (
     SUCCESS_THRESHOLD_VALUE,
     WorkflowStatusMixin,
+    WorkflowContext,
+    IngestionPipelineHandler,
 )
+
+from metadata.config.common import WorkflowExecutionError
 
 logger = ingestion_logger()
 
@@ -66,7 +70,7 @@ class InvalidWorkflowJSONException(Exception):
     """
 
 
-class BaseWorkflow(ABC, WorkflowStatusMixin):
+class BaseWorkflow(ABC):
     """
     Base workflow implementation
     """
@@ -99,15 +103,21 @@ class BaseWorkflow(ABC, WorkflowStatusMixin):
         self.metadata_config = metadata_config
         self.metadata = create_ometa_client(metadata_config)
 
+
         self.post_init()
 
-    @property
-    def ingestion_pipeline(self):
-        """Get or create the Ingestion Pipeline from the configuration"""
-        if not self._ingestion_pipeline:
-            self._ingestion_pipeline = self.get_or_create_ingestion_pipeline()
+        self.workflow_context = WorkflowContext.create(
+            service_name=self.config.source.serviceName,
+            service_type=service_type,
+            ingestion_pipeline_fqn=self.config.ingestionPipelineFQN,
+            source_config=self.config.source.sourceConfig,
+            steps=self.workflow_steps()
+        )
+        self.ingestion_pipeline_handler = IngestionPipelineHandler.from_workflow_context(
+            self.workflow_context,
+            self.metadata
+        )
 
-        return self._ingestion_pipeline
 
     def stop(self) -> None:
         """
@@ -176,7 +186,7 @@ class BaseWorkflow(ABC, WorkflowStatusMixin):
         pipeline_state = PipelineState.success
         self.timer.trigger()
         try:
-            self.set_ingestion_pipeline_status(state=PipelineState.running)
+            self.ingestion_pipeline_handler.set_status(state=PipelineState.running)
             self.execute_internal()
 
             if SUCCESS_THRESHOLD_VALUE <= self.calculate_success() < 100:
@@ -189,8 +199,8 @@ class BaseWorkflow(ABC, WorkflowStatusMixin):
 
         # Force resource closing. Required for killing the threading
         finally:
-            ingestion_status = self.build_ingestion_status()
-            self.set_ingestion_pipeline_status(pipeline_state, ingestion_status)
+            ingestion_status = self.ingestion_pipeline_handler.build_ingestion_status()
+            self.ingestion_pipeline_handler.set_status(pipeline_state, ingestion_status)
             self.stop()
 
     @property
@@ -199,77 +209,23 @@ class BaseWorkflow(ABC, WorkflowStatusMixin):
         If the config does not have an informed run id, we'll
         generate and assign one here.
         """
-        if not self._run_id:
-            if self.config.pipelineRunId:
-                self._run_id = str(self.config.pipelineRunId.__root__)
-            else:
-                self._run_id = str(uuid.uuid4())
+        return self.workflow_context.run_id
 
-        return self._run_id
-
-    def get_or_create_ingestion_pipeline(self) -> Optional[IngestionPipeline]:
+    def raise_from_status(self, raise_warnings=False):
         """
-        If we get the `ingestionPipelineFqn` from the `workflowConfig`, it means we want to
-        keep track of the status.
-        - During the UI deployment, the IngestionPipeline is already created from the UI.
-        - From external deployments, we might need to create the Ingestion Pipeline the first time
-          the YAML is executed.
-        If the Ingestion Pipeline is not created, create it now to update the status.
-
-        Note that during the very first run, the service might not even be created yet. In that case,
-        we won't be able to flag the RUNNING status. We'll wait until the metadata ingestion
-        workflow has prepared the necessary components, and we will update the SUCCESS/FAILED
-        status at the end of the flow.
+        Method to raise error if failed execution
+        and updating Ingestion Pipeline Status
         """
         try:
-            maybe_pipeline: Optional[IngestionPipeline] = self.metadata.get_by_name(
-                entity=IngestionPipeline, fqn=self.config.ingestionPipelineFQN
-            )
+            self.raise_from_status_internal(raise_warnings)
+        except WorkflowExecutionError as err:
+            self.ingestion_pipeline_handler.set_status(PipelineState.failed)
+            raise err
 
-            if maybe_pipeline:
-                return maybe_pipeline
-
-            # Get the name from <service>.<name> or, for test suites, <tableFQN>.testSuite
-            *_, pipeline_name = fqn.split(self.config.ingestionPipelineFQN)
-
-            service = self._get_ingestion_pipeline_service()
-
-            if service is not None:
-                return self.metadata.create_or_update(
-                    CreateIngestionPipelineRequest(
-                        name=pipeline_name,
-                        service=EntityReference(
-                            id=service.id,
-                            type=get_reference_type_from_service_type(
-                                self.service_type
-                            ),
-                        ),
-                        pipelineType=get_pipeline_type_from_source_config(
-                            self.config.source.sourceConfig.config
-                        ),
-                        sourceConfig=self.config.source.sourceConfig,
-                        airflowConfig=AirflowConfig(),
-                    )
-                )
-
-            return maybe_pipeline
-
-        except Exception as exc:
-            logger.error(
-                f"Error trying to get or create the Ingestion Pipeline due to [{exc}]"
-            )
-            return None
-
-    def _get_ingestion_pipeline_service(self) -> Optional[T]:
+    def result_status(self) -> int:
         """
-        Ingestion Pipelines are linked to either an EntityService (DatabaseService, MessagingService,...)
-        or a Test Suite.
-
-        Depending on the Source Config Type, we'll need to GET one or the other to create
-        the Ingestion Pipeline
+        Returns 1 if source status is failed, 0 otherwise.
         """
-
-        return self.metadata.get_by_name(
-            entity=get_service_class_from_service_type(self.service_type),
-            fqn=self.config.source.serviceName,
-        )
+        if self.get_failures():
+            return 1
+        return 0
