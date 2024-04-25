@@ -59,6 +59,27 @@ class Source(IterStep, ABC):
     def run(self) -> Iterable[Optional[Entity]]:
         yield from super().run()
 
+class SourceStep(IterStep, ABC):
+    """
+    Abstract source implementation. The workflow will run
+    its next_record and pass them to the next step.
+    """
+
+    @abstractmethod
+    def prepare(self):
+        pass
+
+    @abstractmethod
+    def test_connection(self) -> None:
+        pass
+
+    @property
+    def name(self) -> str:
+        return "Source"
+
+    @calculate_execution_time_generator(context="Source")
+    def run(self) -> Iterable[Optional[Entity]]:
+        yield from super().run()
 
 class Sink(ReturnStep, ABC):
     """All Sinks must inherit this base class."""
